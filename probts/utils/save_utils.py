@@ -52,7 +52,7 @@ def save_point_error(target, predict, input_dict, hor_str):
 
 def load_checkpoint(Model, checkpoint_path, scaler=None, learning_rate=None, no_training=False, **kwargs):
     # Load the checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+    checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage, weights_only=False)
     # Extract the arguments for the forecaster
     forecaster_args = checkpoint['hyper_parameters']['forecaster']
 
