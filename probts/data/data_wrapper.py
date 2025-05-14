@@ -41,7 +41,7 @@ class ProbTSBatchData:
         """Move all tensors to the specified device."""
         for k, v in self.__dict__.items():
             if v is not None and torch.is_tensor(v):
-                v.to(device)
+                self.__dict__[k] = v.to(device)
         self.device = device
 
     def _expand_dimensions(self):
