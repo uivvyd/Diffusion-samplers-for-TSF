@@ -31,11 +31,18 @@ class CSDI(Forecaster):
         n_layers: int = 4,
         sample_size: int = 64,
         linear_trans: bool = False,
+        solver_num_steps=10,
+        solver='euler',
+        solver_schedule='linear',
         **kwargs
     ):
         super().__init__(**kwargs)
         self.autoregressive = False
         self.dist_args = nn.Identity()
+
+        self.solver_num_steps = solver_num_steps
+        self.solver_schedule = solver_schedule
+        self.solver = solver
 
         self.emb_time_dim = emb_time_dim
         self.emb_feature_dim = emb_feature_dim
@@ -170,31 +177,194 @@ class CSDI(Forecaster):
         sample = sample.permute(0,1,3,2)
         return sample[:, : , -self.prediction_length:, :] # [B N L K]
 
+    @torch.no_grad()
+    def get_eps(self, sample, t, observed_data, cond_mask, side_info):
+        cond_obs = (cond_mask * observed_data).unsqueeze(1)
+        noisy_target = ((1 - cond_mask) * sample).unsqueeze(1)  # [B 1 K L]
+        diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
+        predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(observed_data.device))
+        return predicted
+
+    @torch.no_grad()
+    def ddpm_sample(self, observed_data, cond_mask, side_info):
+        current_sample = torch.randn_like(observed_data).to(observed_data.device)
+
+        for t in range(self.num_steps - 1, -1, -1):
+            eps = self.get_eps(current_sample, t, observed_data, cond_mask, side_info)
+
+            coeff1 = 1 / self.alpha_hat[t] ** 0.5
+            coeff2 = (1 - self.alpha_hat[t]) / (1 - self.alpha[t]) ** 0.5
+            current_sample = coeff1 * (current_sample - coeff2 * eps)
+
+            if t > 0:
+                noise = torch.randn_like(current_sample).to(observed_data.device)
+                sigma = (
+                                (1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]
+                        ) ** 0.5
+                current_sample += sigma * noise
+
+        return current_sample
+
+    @torch.no_grad()
+    def euler_sample(self, observed_data, cond_mask, side_info, timestamps):
+        seq = torch.randn_like(observed_data).to(observed_data.device)
+
+        alphas = torch.flip(torch.tensor(self.alpha)[timestamps], dims=(0,))
+        betas = torch.flip(torch.tensor(self.beta)[timestamps], dims=(0,))
+
+        for i, t in enumerate(timestamps[::-1][:-1]):
+            alpha_cur = alphas[i]
+            beta_cur = betas[i]
+            noise = torch.randn_like(seq)
+            eps = self.get_eps(seq, t, observed_data, cond_mask, side_info)
+
+            sigma_t = torch.sqrt(1 - alpha_cur)
+            velocity = - eps / sigma_t
+            delta = timestamps[i + 1] - timestamps[i]
+
+            seq += beta_cur * (seq / 2 + velocity) * delta
+            seq += torch.sqrt(beta_cur * delta) * noise
+
+        return seq
+
+    @torch.no_grad()
+    def heun_sample(self, observed_data, cond_mask, side_info):
+        timestamps = np.linspace(0, self.num_steps - 1, self.solver_num_steps).astype(int)
+        delta = timestamps[1] - timestamps[0]
+        seq = torch.randn_like(observed_data).to(observed_data.device)
+
+        alphas = torch.flip(torch.tensor(self.alpha)[timestamps], dims=(0,))
+        betas = torch.flip(torch.tensor(self.beta)[timestamps], dims=(0,))
+
+        for i, t in enumerate(timestamps[::-1][:-1]):
+            alpha_cur = alphas[i]
+            beta_cur = betas[i]
+            noise = torch.randn_like(seq)
+            eps = self.get_eps(seq, t, observed_data, cond_mask, side_info)
+
+            sigma_t = torch.sqrt(1 - alpha_cur)
+            velocity = - eps / sigma_t
+            drift = beta_cur * (seq / 2 + velocity) * delta
+            diff = torch.sqrt(beta_cur * delta) * noise
+            seq_hat = seq + drift + diff
+
+            if i < self.solver_num_steps - 1:
+                i += 1
+                alpha_next = alphas[i]
+                beta_next = betas[i]
+                eps_hat = self.get_eps(seq_hat, timestamps[::-1][i], observed_data, cond_mask, side_info)
+
+                velocity = - eps_hat / torch.sqrt(1 - alpha_next)
+                corr = beta_next * (seq_hat / 2 + velocity) * delta
+                diff_next = torch.sqrt(beta_next * delta) * noise
+                seq += (drift + corr) / 2 + (diff + diff_next) / 2
+            else:
+                seq = seq_hat
+
+        return seq
+
+    @torch.no_grad()
+    def ddim_sample(self, observed_data, cond_mask, side_info, timestamps):
+        seq = torch.randn_like(observed_data).to(observed_data.device)
+
+        alphas = torch.flip(torch.tensor(self.alpha)[timestamps], dims=(0,))
+        
+        for i, t in enumerate(timestamps[::-1][:-1]):
+            alpha_cur = alphas[i]
+            alpha_prev = alphas[i + 1]
+            eps = self.get_eps(seq, t, observed_data, cond_mask, side_info)
+
+            predicted_seq0 = (seq - torch.sqrt(1 - alpha_cur) * eps) / torch.sqrt(alpha_cur)
+            direction_seqt = torch.sqrt(1 - alpha_prev) * eps
+            seq = torch.sqrt(alpha_prev) * predicted_seq0 + direction_seqt
+
+        return seq
+
+    @torch.no_grad()
+    def dpm1_sample(self, observed_data, cond_mask, side_info, timestamps):
+        seq = torch.randn_like(observed_data).to(observed_data.device)
+
+        alphas = torch.flip(torch.tensor(self.alpha)[timestamps], dims=(0,))
+        means = torch.sqrt(alphas)
+        sigmas = torch.sqrt(1 - alphas)
+        lambdas = torch.log(means / sigmas)
+
+        for i, t in enumerate(timestamps[::-1][:-1]):
+            mean_cur = means[i]
+            mean_next = means[i + 1]
+            sigma_next = sigmas[i + 1]
+            delta = lambdas[i + 1] - lambdas[i]
+            eps = self.get_eps(seq, t, observed_data, cond_mask, side_info)
+
+            seq = mean_next / mean_cur * seq - sigma_next * torch.expm1(delta) * eps
+
+        return seq
+
+    @torch.no_grad()
+    def dpm2_sample(self, observed_data, cond_mask, side_info):
+        seq = torch.randn_like(observed_data).to(observed_data.device)
+
+        alphas = torch.tensor(self.alpha)
+        means = torch.sqrt(alphas)
+        sigmas = torch.sqrt(1 - alphas)
+        lambdas = torch.log(means / sigmas)
+
+        def inverse_lambda(lamb, norm_factor=1):
+            beta_start = self.beta[0]
+            beta_end = self.beta[-1]
+            tmp = 2. * (beta_end - beta_start) * torch.logaddexp(-2. * lamb, torch.zeros((1,)).to(lamb))
+            Delta = beta_start ** 2 + tmp
+            res = tmp / (torch.sqrt(Delta) + beta_start) / (beta_end - beta_start)
+            return res * norm_factor
+
+        norm_factor = float(self.num_steps / inverse_lambda(lambdas[-1]))
+        lambdas = torch.linspace(lambdas[-1], lambdas[0], self.solver_num_steps)
+
+        for i in range(len(lambdas) - 1):
+            t = int(torch.round(inverse_lambda(lambdas[i], norm_factor=norm_factor))) - 1
+            t_next = int(inverse_lambda(lambdas[i + 1], norm_factor=norm_factor))
+            r = int(inverse_lambda((lambdas[i] + lambdas[i + 1]) / 2, norm_factor=norm_factor))
+            mean_cur = means[t]
+            mean_next = means[t_next]
+            mean_r = means[r]
+            sigma_next = sigmas[t_next]
+            sigma_r = sigmas[r]
+            delta = lambdas[i + 1] - lambdas[i]
+
+            eps = self.get_eps(seq, t, observed_data, cond_mask, side_info)
+            seq_r = mean_r / mean_cur * seq - sigma_r * torch.expm1(delta / 2) * eps
+            eps_r = self.get_eps(seq_r, r, observed_data, cond_mask, side_info)
+            seq = mean_next / mean_cur * seq - sigma_next * torch.expm1(delta) * eps_r
+
+        return seq
+
+    @torch.no_grad()
     def sample(self, observed_data, cond_mask, side_info, n_samples):
         B, K, L = observed_data.shape
         imputed_samples = torch.zeros(B, n_samples, K, L).to(observed_data.device)
 
+        if self.solver_schedule == "linear":
+            timestamps = np.linspace(0, self.num_steps - 1, self.solver_num_steps).astype(int)
+        elif self.solver_schedule == "quad":
+            timestamps = (np.linspace(0, self.num_steps ** 0.5 - 1, self.solver_num_steps) ** 2).astype(int)
+        else:
+            raise NotImplementedError(f"unknown steps schedule: {self.solver_schedule}")
+
         for i in range(n_samples):
-            current_sample = torch.randn_like(observed_data).to(observed_data.device)
-
-            for t in range(self.num_steps - 1, -1, -1):
-                cond_obs = (cond_mask * observed_data).unsqueeze(1)
-                noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1) # [B 1 K L]
-                diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
-                predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(observed_data.device))
-
-                coeff1 = 1 / self.alpha_hat[t] ** 0.5
-                coeff2 = (1 - self.alpha_hat[t]) / (1 - self.alpha[t]) ** 0.5
-                current_sample = coeff1 * (current_sample - coeff2 * predicted)
-
-                if t > 0:
-                    noise = torch.randn_like(current_sample).to(observed_data.device)
-                    sigma = (
-                        (1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]
-                    ) ** 0.5
-                    current_sample += sigma * noise
+            if self.solver == 'ddpm':
+                current_sample = self.ddpm_sample(observed_data, cond_mask, side_info)
+            elif self.solver == 'euler':
+                current_sample = self.euler_sample(observed_data, cond_mask, side_info, timestamps)
+            elif self.solver == 'heun':
+                current_sample = self.heun_sample(observed_data, cond_mask, side_info)
+            elif self.solver == 'ddim':
+                current_sample =  self.ddim_sample(observed_data, cond_mask, side_info, timestamps)
+            elif self.solver == 'dpm1':
+                current_sample =  self.dpm1_sample(observed_data, cond_mask, side_info, timestamps)
+            elif self.solver == 'dpm2':
+                current_sample =  self.dpm2_sample(observed_data, cond_mask, side_info)
+            else:
+                raise NotImplementedError(f"unknown solver: {self.solver}")
 
             imputed_samples[:, i] = current_sample.detach()
         return imputed_samples
-
-
