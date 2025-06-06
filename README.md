@@ -20,7 +20,7 @@
 Основные метрики работы сэмплеров для SSSD на датасетe ETTh1.
 </p>
 <p align="center">
-<img src="docs/euler_15" width="800px"/>
+<img src="docs/euler_15.png" width="800px"/>
 <br>
 Результат работы SSSD с методом Эйлера (15 шагов) на датасете Traffic.
 </p>
